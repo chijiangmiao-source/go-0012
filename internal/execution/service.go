@@ -16,6 +16,11 @@ import (
 
 type EventRecorder interface {
 	Append(taskID int64, input audit.EventInput) (audit.Event, error)
+	// AppendWithinTx records an event participating in the store transaction
+	// carried by ctx, so it commits or rolls back together with the caller's
+	// own writes. Implementations that are not backed by a database must behave
+	// like Append.
+	AppendWithinTx(ctx context.Context, taskID int64, input audit.EventInput) (audit.Event, error)
 }
 
 type idempotencyRecord struct {
@@ -86,7 +91,7 @@ func (s *Service) Claim(assignmentID, vesselID, expectedVersion int64, actor dom
 	s.mu.Unlock()
 
 	if s.events != nil {
-		_, err := s.events.Append(assignment.TaskID, audit.EventInput{
+		_, err := s.events.AppendWithinTx(context.Background(), assignment.TaskID, audit.EventInput{
 			Type:     audit.EventAssignmentClaimed,
 			Actor:    actor,
 			VesselID: vesselID,
@@ -195,15 +200,31 @@ WHERE id = ? AND version = ? AND status = 'confirmed' AND vessel_id = ?`, actor.
 			return err
 		}
 		assignment, err = s.loadAssignment(txCtx, assignmentID)
-		return err
+		if err != nil {
+			return err
+		}
+		// Record the timeline event inside the same transaction so the claim
+		// state, sector state and audit event commit or roll back together.
+		// Otherwise a timeline write failure after commit would leave the
+		// assignment and sector claimed with no assignment_claimed event, and a
+		// client retry would only see sector_claimed.
+		if s.events != nil {
+			if _, err := s.events.AppendWithinTx(txCtx, assignment.TaskID, audit.EventInput{
+				Type:     audit.EventAssignmentClaimed,
+				Actor:    actor,
+				VesselID: vesselID,
+				Occurred: now,
+				Payload:  map[string]any{"assignment_id": assignmentID},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return Assignment{}, err
 	}
-	if s.events != nil {
-		_, err = s.events.Append(assignment.TaskID, audit.EventInput{Type: audit.EventAssignmentClaimed, Actor: actor, VesselID: vesselID, Occurred: s.clock.Now(), Payload: map[string]any{"assignment_id": assignmentID}})
-	}
-	return assignment, err
+	return assignment, nil
 }
 
 func (s *Service) progressSQL(ctx context.Context, assignmentID, vesselID, expectedVersion int64, key string, deltaBasisPoints int, actor domain.Actor) (ProgressResult, error) {

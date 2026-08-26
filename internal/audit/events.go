@@ -82,6 +82,17 @@ func (t *Timeline) Append(taskID int64, input EventInput) (Event, error) {
 	return event, nil
 }
 
+// AppendWithinTx appends an event participating in an existing store
+// transaction carried by ctx. When the timeline is persisted, the event is
+// written through the same transaction so it commits or rolls back together
+// with the caller's writes. For the in-memory timeline it behaves like Append.
+func (t *Timeline) AppendWithinTx(ctx context.Context, taskID int64, input EventInput) (Event, error) {
+	if t.db != nil {
+		return t.appendPersistent(ctx, taskID, input)
+	}
+	return t.Append(taskID, input)
+}
+
 func (t *Timeline) List(taskID int64, eventType string) []Event {
 	if t.db != nil {
 		events, err := t.ListPersistent(context.Background(), EventFilter{TaskID: taskID, EventType: eventType, Page: 1, PageSize: 1000})
