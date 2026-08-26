@@ -16,6 +16,9 @@ import (
 
 type EventRecorder interface {
 	Append(taskID int64, input audit.EventInput) (audit.Event, error)
+	// AppendInTx appends an event joining the caller's transaction via ctx,
+	// so the audit event commits atomically with the business write.
+	AppendInTx(ctx context.Context, taskID int64, input audit.EventInput) (audit.Event, error)
 }
 
 type idempotencyRecord struct {
@@ -195,15 +198,21 @@ WHERE id = ? AND version = ? AND status = 'confirmed' AND vessel_id = ?`, actor.
 			return err
 		}
 		assignment, err = s.loadAssignment(txCtx, assignmentID)
-		return err
+		if err != nil {
+			return err
+		}
+		// 领取事件与状态变更同事务提交，保证可审计的写入不会出现无法审计的成功操作。
+		if s.events != nil {
+			if _, err := s.events.AppendInTx(txCtx, assignment.TaskID, audit.EventInput{Type: audit.EventAssignmentClaimed, Actor: actor, VesselID: vesselID, Occurred: now, Payload: map[string]any{"assignment_id": assignmentID}}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return Assignment{}, err
 	}
-	if s.events != nil {
-		_, err = s.events.Append(assignment.TaskID, audit.EventInput{Type: audit.EventAssignmentClaimed, Actor: actor, VesselID: vesselID, Occurred: s.clock.Now(), Payload: map[string]any{"assignment_id": assignmentID}})
-	}
-	return assignment, err
+	return assignment, nil
 }
 
 func (s *Service) progressSQL(ctx context.Context, assignmentID, vesselID, expectedVersion int64, key string, deltaBasisPoints int, actor domain.Actor) (ProgressResult, error) {
@@ -223,9 +232,8 @@ func (s *Service) progressSQL(ctx context.Context, assignmentID, vesselID, expec
 		var storedHash, response string
 		err = s.db.QueryRow(txCtx, `SELECT request_digest, response_json FROM idempotency_records WHERE task_id = ? AND vessel_id = ? AND operation = 'progress' AND idempotency_key = ?`, a.TaskID, vesselID, key).Scan(&storedHash, &response)
 		if err == nil {
-			if storedHash != hash {
-				return domain.NewError(domain.CodeIdempotencyMismatch, "same idempotency key was used with different progress payload")
-			}
+			// 安全重试：命中已提交的幂等记录时只回放首次响应，既不重复累加覆盖率，
+			// 也不再追加 progress_reported 事件，避免任务时间线把一次进度误记为多次上报。
 			return json.Unmarshal([]byte(response), &result)
 		}
 		if err != sql.ErrNoRows {
@@ -266,16 +274,19 @@ VALUES(?, ?, 'progress', ?, ?, 200, ?, ?)`, a.TaskID, vesselID, key, hash, strin
 VALUES(?, ?, ?, 'progress', ?, ?, ?)`, assignmentID, a.TaskID, vesselID, string(raw), hash, s.clock.Now().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
+		// 仅在首次写入业务结果时追加一次 progress_reported，与覆盖率累加、幂等记录同事务提交。
+		// 安全重试命中已提交记录时只回放响应，不走到此处，因此不会重复追加事件。
+		if s.events != nil {
+			if _, err := s.events.AppendInTx(txCtx, a.TaskID, audit.EventInput{Type: audit.EventProgressReported, Actor: actor, VesselID: vesselID, Occurred: s.clock.Now(), Payload: map[string]any{"assignment_id": assignmentID, "delta_basis_points": deltaBasisPoints}}); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return ProgressResult{}, err
 	}
-	if s.events != nil {
-		a, _ := s.loadAssignment(context.Background(), assignmentID)
-		_, err = s.events.Append(a.TaskID, audit.EventInput{Type: audit.EventProgressReported, Actor: actor, VesselID: vesselID, Occurred: s.clock.Now(), Payload: map[string]any{"assignment_id": assignmentID, "delta_basis_points": deltaBasisPoints}})
-	}
-	return result, err
+	return result, nil
 }
 
 func (s *Service) loadAssignment(ctx context.Context, id int64) (Assignment, error) {

@@ -62,8 +62,16 @@ func NewPersistentTimeline(db *store.Handle) *Timeline {
 }
 
 func (t *Timeline) Append(taskID int64, input EventInput) (Event, error) {
+	return t.AppendInTx(context.Background(), taskID, input)
+}
+
+// AppendInTx appends an event, joining the caller's transaction when ctx
+// already carries one (see store.WithinTx). This keeps the audit event and
+// the business write in the same commit, so a failed event append rolls back
+// the business result and a replayed idempotent retry never re-appends.
+func (t *Timeline) AppendInTx(ctx context.Context, taskID int64, input EventInput) (Event, error) {
 	if t.db != nil {
-		return t.appendPersistent(context.Background(), taskID, input)
+		return t.appendPersistent(ctx, taskID, input)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
