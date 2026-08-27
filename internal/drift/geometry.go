@@ -18,10 +18,9 @@ var sectorDefinitions = []struct {
 
 func buildSectors(center domain.Position, direction, radiusNM float64) []Sector {
 	sectors := make([]Sector, 0, 4)
-	ring := []domain.Position{center}
 	for i, def := range sectorDefinitions {
 		start := direction + def.offset
-		ring = ring[:1]
+		ring := []domain.Position{center}
 		for step := 0; step <= 90; step += 15 {
 			ring = append(ring, bearingPoint(center, start+float64(step), radiusNM).Rounded6())
 		}
