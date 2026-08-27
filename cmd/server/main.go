@@ -33,13 +33,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	clock := domain.SystemClock{}
 	handle, err := store.Open(context.Background(), cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	// 进程重启后依据持久化心跳重新判定在线状态：把 last_heartbeat 已超过离线阈值的
+	// 船只立即标记为 offline，避免恢复后 GET /v1/vessels 仍显示 online 并被自动调度当作可用。
+	if err := handle.Recover(context.Background(), clock.Now()); err != nil {
+		log.Fatalf("restart recovery failed: %v", err)
+	}
 	timeline := audit.NewPersistentTimeline(handle)
 	notifications := audit.NewNotificationCenter()
-	clock := domain.SystemClock{}
 	server := api.NewServer(api.Dependencies{
 		Store:         handle,
 		Missions:      mission.NewPersistentService(clock, timeline, handle),
