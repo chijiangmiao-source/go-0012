@@ -82,6 +82,17 @@ func (t *Timeline) Append(taskID int64, input EventInput) (Event, error) {
 	return event, nil
 }
 
+// AppendTx records an event and, when persistent, joins the in-flight
+// transaction carried by ctx so the event is committed or rolled back together
+// with the caller's own mutation. Callers that mutate task state in the same
+// transaction must use this instead of Append to keep state and audit atomic.
+func (t *Timeline) AppendTx(ctx context.Context, taskID int64, input EventInput) (Event, error) {
+	if t.db != nil {
+		return t.appendPersistent(ctx, taskID, input)
+	}
+	return t.Append(taskID, input)
+}
+
 func (t *Timeline) List(taskID int64, eventType string) []Event {
 	if t.db != nil {
 		events, err := t.ListPersistent(context.Background(), EventFilter{TaskID: taskID, EventType: eventType, Page: 1, PageSize: 1000})

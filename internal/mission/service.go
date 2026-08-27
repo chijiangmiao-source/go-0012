@@ -13,6 +13,7 @@ import (
 
 type EventRecorder interface {
 	Append(taskID int64, input audit.EventInput) (audit.Event, error)
+	AppendTx(ctx context.Context, taskID int64, input audit.EventInput) (audit.Event, error)
 }
 
 type Service struct {
@@ -414,24 +415,34 @@ func (s *Service) transitionSQL(ctx context.Context, taskID int64, req Transitio
 	if req.TargetStatus == StatusTerminated {
 		term = req.TerminationReason
 	}
-	res, err := s.db.Exec(ctx, `UPDATE search_tasks SET status = ?, submitted_at = COALESCE(?, submitted_at), found_at = ?, found_latitude = ?, found_longitude = ?, termination_reason = ?, version = version + 1, updated_at = ?
+	var updated Task
+	err = s.db.WithinTx(ctx, func(txCtx context.Context) error {
+		res, execErr := s.db.Exec(txCtx, `UPDATE search_tasks SET status = ?, submitted_at = COALESCE(?, submitted_at), found_at = ?, found_latitude = ?, found_longitude = ?, termination_reason = ?, version = version + 1, updated_at = ?
 WHERE id = ? AND version = ?`, string(req.TargetStatus), submitted, foundAt, foundLat, foundLon, nullString(term), now.Format(time.RFC3339Nano), taskID, req.ExpectedVersion)
+		if execErr != nil {
+			return execErr
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			current, _ := s.getTaskSQL(txCtx, taskID)
+			return domain.VersionError(domain.CodeStaleVersion, "task version does not match expected_version", current.Version)
+		}
+		latest, getErr := s.getTaskSQL(txCtx, taskID)
+		if getErr != nil {
+			return getErr
+		}
+		if s.events != nil {
+			if _, appendErr := s.events.AppendTx(txCtx, taskID, audit.EventInput{Type: audit.EventTaskTransitioned, Actor: req.Actor, Occurred: now, Payload: map[string]any{"status": latest.Status}}); appendErr != nil {
+				return appendErr
+			}
+		}
+		updated = latest
+		return nil
+	})
 	if err != nil {
 		return Task{}, err
 	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		current, _ := s.getTaskSQL(ctx, taskID)
-		return Task{}, domain.VersionError(domain.CodeStaleVersion, "task version does not match expected_version", current.Version)
-	}
-	updated, err := s.getTaskSQL(ctx, taskID)
-	if err != nil {
-		return Task{}, err
-	}
-	if s.events != nil {
-		_, err = s.events.Append(taskID, audit.EventInput{Type: audit.EventTaskTransitioned, Actor: req.Actor, Occurred: now, Payload: map[string]any{"status": updated.Status}})
-	}
-	return updated, err
+	return updated, nil
 }
 
 func parseTime(raw string) time.Time {
