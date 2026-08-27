@@ -215,24 +215,29 @@ func (s *Service) progressSQL(ctx context.Context, assignmentID, vesselID, expec
 	}
 	hash := requestHash(map[string]any{"assignment_id": assignmentID, "vessel_id": vesselID, "expected": expectedVersion, "delta": deltaBasisPoints})
 	var result ProgressResult
+	var replayed bool
 	err := s.db.WithinTx(ctx, func(txCtx context.Context) error {
 		a, err := s.loadAssignment(txCtx, assignmentID)
 		if err != nil {
 			return err
 		}
-		if a.Version != expectedVersion {
-			return domain.VersionError(domain.CodeStaleVersion, "assignment version does not match expected_version", a.Version)
-		}
+		// Replay the stored response for a repeated Idempotency-Key before any
+		// version check: a lost response must surface the first success, not a
+		// stale_version conflict caused by the version bump from that first call.
 		var storedHash, response string
 		err = s.db.QueryRow(txCtx, `SELECT request_digest, response_json FROM idempotency_records WHERE task_id = ? AND vessel_id = ? AND operation = 'progress' AND idempotency_key = ?`, a.TaskID, vesselID, key).Scan(&storedHash, &response)
 		if err == nil {
 			if storedHash != hash {
 				return domain.NewError(domain.CodeIdempotencyMismatch, "same idempotency key was used with different progress payload")
 			}
+			replayed = true
 			return json.Unmarshal([]byte(response), &result)
 		}
 		if err != sql.ErrNoRows {
 			return err
+		}
+		if a.Version != expectedVersion {
+			return domain.VersionError(domain.CodeStaleVersion, "assignment version does not match expected_version", a.Version)
 		}
 		if a.VesselID != vesselID {
 			return domain.NewError(domain.CodeForbidden, "assignment belongs to another vessel")
@@ -271,7 +276,9 @@ VALUES(?, ?, ?, 'progress', ?, ?, ?)`, assignmentID, a.TaskID, vesselID, string(
 	if err != nil {
 		return ProgressResult{}, err
 	}
-	if s.events != nil {
+	// A replayed request already produced its audit event on the first call;
+	// don't append a duplicate progress_reported event for the retry.
+	if !replayed && s.events != nil {
 		a, _ := s.loadAssignment(context.Background(), assignmentID)
 		_, err = s.events.Append(a.TaskID, audit.EventInput{Type: audit.EventProgressReported, Actor: actor, VesselID: vesselID, Occurred: s.clock.Now(), Payload: map[string]any{"assignment_id": assignmentID, "delta_basis_points": deltaBasisPoints}})
 	}
