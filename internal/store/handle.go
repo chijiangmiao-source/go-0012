@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -67,10 +68,10 @@ func (h *Handle) configure(ctx context.Context) error {
 }
 
 func (h *Handle) applyMigrations(ctx context.Context) error {
+	if _, err := h.db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"); err != nil {
+		return err
+	}
 	for _, migration := range h.migrations {
-		if _, err := h.db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"); err != nil {
-			return err
-		}
 		var exists string
 		err := h.db.QueryRowContext(ctx, "SELECT version FROM schema_migrations WHERE version = ?", migration.Version).Scan(&exists)
 		if err == nil {
@@ -79,18 +80,24 @@ func (h *Handle) applyMigrations(ctx context.Context) error {
 		if err != sql.ErrNoRows {
 			return err
 		}
+		// Run the schema change and the version bookkeeping in a single
+		// transaction so a failing migration is never recorded as applied.
+		// Without this, a migration that fails after its version row was
+		// committed would be skipped on the next start, leaving the business
+		// tables missing while /readyz still reports healthy.
 		tx, err := h.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)", migration.Version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err = tx.ExecContext(ctx, migration.SQL); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", migration.Version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 		if err = tx.Commit(); err != nil {
-			return err
-		}
-		if _, err = h.db.ExecContext(ctx, migration.SQL); err != nil {
 			return err
 		}
 	}
@@ -104,9 +111,35 @@ func (h *Handle) Ready(ctx context.Context) error {
 	if err := h.db.PingContext(ctx); err != nil {
 		return domain.NewError(domain.CodeStorageUnavailable, "database is not reachable")
 	}
-	var count int
-	if err := h.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
+	// Every recorded migration version must be present for the schema to be
+	// considered complete. A partially applied migration is retried on start,
+	// but checking the expected versions here keeps /readyz honest when the
+	// migrations table was left in an inconsistent state.
+	expected := make(map[string]struct{}, len(h.migrations))
+	for _, migration := range h.migrations {
+		expected[migration.Version] = struct{}{}
+	}
+	rows, err := h.db.QueryContext(ctx, "SELECT version FROM schema_migrations")
+	if err != nil {
+		return domain.NewError(domain.CodeStorageUnavailable, "schema migrations are not recorded")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return err
+		}
+		delete(expected, version)
+	}
+	if err := rows.Err(); err != nil {
 		return err
+	}
+	if len(expected) != 0 {
+		missing := make([]string, 0, len(expected))
+		for version := range expected {
+			missing = append(missing, version)
+		}
+		return domain.NewError(domain.CodeStorageUnavailable, "pending schema migrations: "+strings.Join(missing, ", "))
 	}
 	return nil
 }
