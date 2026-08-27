@@ -22,8 +22,12 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "server" {
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] != "server" {
 		log.Fatal("usage: offshore-buoy server [-addr :8080] [-sqlite offshore-buoy.db]")
+	}
+	if len(args) > 0 {
+		args = args[1:]
 	}
 
 	cfg := store.DefaultConfig()
@@ -32,7 +36,7 @@ func main() {
 	flags.StringVar(&cfg.SQLitePath, "sqlite", cfg.SQLitePath, "SQLite database file path")
 	flags.DurationVar(&cfg.HeartbeatTimeout, "heartbeat-timeout", cfg.HeartbeatTimeout, "offline heartbeat threshold")
 	flags.DurationVar(&cfg.InspectionPeriod, "inspection-period", cfg.InspectionPeriod, "background inspection period")
-	if err := flags.Parse(os.Args[2:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		log.Fatal(err)
 	}
 
