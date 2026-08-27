@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"offshore-buoy-drift-search-loop/internal/api"
@@ -33,7 +36,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	handle, err := store.Open(context.Background(), cfg)
+	ctx := context.Background()
+	handle, err := store.Open(ctx, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -51,11 +55,40 @@ func main() {
 		Replans:       execution.NewReplanStore(),
 	})
 
+	// Background inspection marks vessels offline once their heartbeats exceed
+	// the configured timeout. It runs for the lifetime of the service so the
+	// periodic sweep — not just the one-time startup recovery — keeps GET
+	// /v1/vessels and automatic scheduling consistent with reality.
+	inspectCtx, stopInspect := context.WithCancel(context.Background())
+	_, waitInspect := handle.Inspect(inspectCtx, func() time.Time { return time.Now().UTC() }, cfg.InspectionPeriod)
+
 	httpServer := &http.Server{
 		Addr:              *addr,
 		Handler:           server,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("offshore buoy search service listening on %s", *addr)
-	log.Fatal(httpServer.ListenAndServe())
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpServer.ListenAndServe() }()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-errCh:
+		stopInspect()
+		waitInspect()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server exited: %v", err)
+		}
+	case <-sigCh:
+		log.Printf("shutdown signal received, draining background inspection and HTTP server")
+		stopInspect()
+		waitInspect()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+		cancel()
+	}
+	_ = handle.Close()
 }

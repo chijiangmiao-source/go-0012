@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -137,6 +138,44 @@ WHERE online_status = 'online' AND last_heartbeat_at IS NOT NULL AND last_heartb
 		return nil
 	}
 	return err
+}
+
+// SweepOffline marks vessels whose heartbeats predate the configured timeout as
+// offline. It is the single shared inspection routine used by startup recovery
+// and by the background inspector, so periodic sweeps apply the exact same
+// conditional update (last_heartbeat_at <= check time minus threshold) that
+// avoids racing a fresh heartbeat.
+func (h *Handle) SweepOffline(ctx context.Context, now time.Time) error {
+	return h.Recover(ctx, now)
+}
+
+// Inspect launches a background goroutine that re-applies SweepOffline on the
+// configured InspectionPeriod for as long as ctx is alive. It returns a stop
+// function that cancels the loop and a wait function that blocks until the loop
+// has fully drained. Each sweep failure is logged and left for the next round;
+// the loop never aborts the HTTP service.
+func (h *Handle) Inspect(ctx context.Context, now func() time.Time, period time.Duration) (stop, wait func()) {
+	ticker := time.NewTicker(period)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := h.SweepOffline(ctx, now()); err != nil && !isNoSuchTable(err) {
+					log.Printf("vessel offline inspection sweep failed: %v", err)
+				}
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+	}, func() {
+		<-done
+	}
 }
 
 func isNoSuchTable(err error) bool {
