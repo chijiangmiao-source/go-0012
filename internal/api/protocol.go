@@ -50,7 +50,7 @@ func statusFor(code string) int {
 		return http.StatusNotFound
 	case domain.CodeStaleVersion, domain.CodeInvalidTransition, domain.CodeActiveTaskExists, domain.CodeSectorClaimed, domain.CodeIdempotencyMismatch, domain.CodeScheduleOverlap:
 		return http.StatusConflict
-	case domain.CodeStorageUnavailable:
+	case domain.CodeStorageUnavailable, domain.CodeAuditUnavailable:
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError

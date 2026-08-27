@@ -2,8 +2,8 @@ package api
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -128,8 +128,7 @@ func (s *Server) confirmSchedulePlan(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			if conflicts > 0 {
-				_ = insertConflictNotice(ctx, h, taskID, c.vesselID)
-				return domain.NewError(domain.CodeScheduleOverlap, "confirmed assignment overlaps another active assignment")
+				return &scheduleOverlapError{taskID: taskID, vesselID: c.vesselID, assignmentID: c.id}
 			}
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -148,19 +147,65 @@ func (s *Server) confirmSchedulePlan(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
+		var overlap *scheduleOverlapError
+		if errors.As(err, &overlap) {
+			if auditErr := s.persistScheduleConflictNotice(r, overlap); auditErr != nil {
+				writeError(w, r, auditErr)
+				return
+			}
+		}
 		writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, Response{Data: map[string]any{"plan_id": planID, "status": "confirmed"}, RequestID: requestID(r)})
 }
 
-func insertConflictNotice(ctx context.Context, h interface {
-	Exec(context.Context, string, ...any) (sql.Result, error)
-}, taskID, vesselID int64) error {
-	payload, _ := json.Marshal(map[string]any{"vessel_id": vesselID})
-	_, err := h.Exec(ctx, `INSERT OR IGNORE INTO notifications(task_id, recipient_role, type, dedupe_key, title, payload_json, created_at)
-VALUES(?, 'commander', 'assignment_conflict', ?, '分配时间冲突', ?, ?)`, taskID, "assignment_conflict:"+strconv.FormatInt(taskID, 10)+":"+strconv.FormatInt(vesselID, 10), string(payload), time.Now().UTC().Format(time.RFC3339Nano))
-	return err
+// scheduleOverlapError carries the assignment whose confirmation overlapped an
+// existing active assignment. Returning it from the confirmation transaction
+// rolls back the partial confirmation while still letting the caller persist the
+// rejection audit trail in a separate short transaction afterwards.
+type scheduleOverlapError struct {
+	taskID       int64
+	vesselID     int64
+	assignmentID int64
+}
+
+func (e *scheduleOverlapError) Error() string {
+	return "confirmed assignment overlaps another active assignment"
+}
+
+// persistScheduleConflictNotice records the assignment_conflict notification and
+// the corresponding timeline audit event in a single short transaction that is
+// independent of the rolled-back confirmation. The plan itself stays untouched
+// because the overlap check runs before any confirmation writes. If this audit
+// transaction also fails, the rejection cannot be tracked and the spec requires
+// surfacing 503 audit_unavailable rather than masquerading as an ordinary
+// business conflict.
+func (s *Server) persistScheduleConflictNotice(r *http.Request, overlap *scheduleOverlapError) error {
+	h := s.storeHandle()
+	actor := actorFromRequest(r)
+	now := time.Now().UTC()
+	dedupeKey := "assignment_conflict:" + strconv.FormatInt(overlap.taskID, 10) + ":" + strconv.FormatInt(overlap.vesselID, 10)
+	payload, _ := json.Marshal(map[string]any{"vessel_id": overlap.vesselID, "assignment_id": overlap.assignmentID})
+	return h.WithinTx(r.Context(), func(ctx context.Context) error {
+		if _, err := h.Exec(ctx, `INSERT OR IGNORE INTO notifications(task_id, recipient_role, type, dedupe_key, title, payload_json, created_at)
+VALUES(?, 'commander', 'assignment_conflict', ?, '分配时间冲突', ?, ?)`, overlap.taskID, dedupeKey, string(payload), now.Format(time.RFC3339Nano)); err != nil {
+			return domain.NewError(domain.CodeAuditUnavailable, "assignment conflict notice could not be audited")
+		}
+		var seq int64
+		if err := h.QueryRow(ctx, "SELECT event_sequence + 1 FROM search_tasks WHERE id = ?", overlap.taskID).Scan(&seq); err != nil {
+			return domain.NewError(domain.CodeAuditUnavailable, "assignment conflict notice could not be audited")
+		}
+		eventPayload, _ := json.Marshal(map[string]any{"vessel_id": overlap.vesselID, "assignment_id": overlap.assignmentID, "reason": "assignment_conflict"})
+		if _, err := h.Exec(ctx, `UPDATE search_tasks SET event_sequence = ? WHERE id = ?`, seq, overlap.taskID); err != nil {
+			return domain.NewError(domain.CodeAuditUnavailable, "assignment conflict notice could not be audited")
+		}
+		if _, err := h.Exec(ctx, `INSERT INTO task_events(task_id, sequence, event_type, actor_id, actor_role, vessel_id, occurred_at, payload_json)
+VALUES(?, ?, 'assignment_conflict', ?, ?, NULLIF(?, 0), ?, ?)`, overlap.taskID, seq, actor.ID, string(actor.Role), overlap.vesselID, now.Format(time.RFC3339Nano), string(eventPayload)); err != nil {
+			return domain.NewError(domain.CodeAuditUnavailable, "assignment conflict notice could not be audited")
+		}
+		return nil
+	})
 }
 
 func (s *Server) rejectSchedulePlan(w http.ResponseWriter, r *http.Request) {

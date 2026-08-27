@@ -13,6 +13,7 @@ const (
 	CodeIdempotencyMismatch = "idempotency_mismatch"
 	CodeScheduleOverlap     = "schedule_overlap"
 	CodeStorageUnavailable  = "storage_unavailable"
+	CodeAuditUnavailable    = "audit_unavailable"
 )
 
 type AppError struct {
